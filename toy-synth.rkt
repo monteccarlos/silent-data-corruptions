@@ -1,31 +1,3 @@
-Last login: Thu Feb 26 14:00:45 on ttys000
-vlad@Vlads-MacBook-Air silent-data-corruptions % cd ../../    
-vlad@Vlads-MacBook-Air Downloads % cd ../Desktop/cs257 
-vlad@Vlads-MacBook-Air cs257 % ls
-toy-synth.rkt
-vlad@Vlads-MacBook-Air cs257 % vim toy-synth.rkt
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 #lang rosette
 
 (define NUM-REGS 4)
