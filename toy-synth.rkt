@@ -25,5 +25,23 @@
   (solve
    (begin
      (assert
-"toy-synth.rkt" 47L, 888B
+      (and
+       (valid-reg dst1) (valid-reg dst2)
+       (valid-reg dst3) (valid-reg dst4)
 
+       (valid-reg s11) (valid-reg s12)
+       (valid-reg s21) (valid-reg s22)
+       (valid-reg s31) (valid-reg s32)
+       (valid-reg s41) (valid-reg s42)
+
+       (valid-op op1) (valid-op op2)
+       (valid-op op3) (valid-op op4)))
+
+     ;; example constraint: at least one multiply
+     (assert
+      (or (= op1 3)
+          (= op2 3)
+          (= op3 3)
+          (= op4 3))))))
+
+(displayln sol)
