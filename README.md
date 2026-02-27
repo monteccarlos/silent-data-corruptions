@@ -17,7 +17,7 @@ This is a minimal prototype for a solver-guided test generator.
 We model 4 registers: R0,R1,R2,R3 which are represented as integers
 Each instruction has the form: dst = op src1 src2
 
-### What This Program Does
+### What This Toy Program Does (toy-synth)
 The synthesizer:
 
 Creates symbolic variables representing 4 instructions.
@@ -29,6 +29,9 @@ Constrains them to:
 -Adds an example structural constraint:
 -At least one instruction must be a mul
 -Calls the SMT solver through Rosette.
+
+### Adding History (toy-synth-history)
+Added 'previous run' as a constraint, forcing at least a Hamming distance of 2
 
 Prints a concrete program satisfying the constraints.
 
