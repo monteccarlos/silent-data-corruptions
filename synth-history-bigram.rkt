@@ -1,0 +1,503 @@
+#lang rosette
+
+(require racket/string json racket/cmdline)
+
+;; --------------------------------------------
+;; N-gram-only variant: optimization (minimize overlap) instead of
+;; satisfaction (cap overlap). No depth constraint.
+;; Exports to ngram-suite-export.json.
+;; --------------------------------------------
+
+;; Parameters
+(define NUM-REGS    8)
+(define NUM-OPS     9)
+(define NUM-INSTR   8)
+(define IMM-RANGE  16)
+
+;; Default Seed Program
+(define SEED-PROGRAM
+  (list
+   (list 0 0 1 2  0)
+   (list 1 1 0 3  1)
+   (list 2 2 1 4  0)
+   (list 3 3 2 5  3)
+   (list 4 4 3 1  2)
+   (list 5 5 4 2  0)
+   (list 6 6 5 3  1)
+   (list 7 7 6 0  0)))
+
+(define test-suite (box '()))
+
+(define (add-to-suite! prog)
+  (set-box! test-suite (append (unbox test-suite) (list prog))))
+
+(define (suite-size)
+  (length (unbox test-suite)))
+
+;; Helpers
+(define (valid-reg r) (and (>= r 0) (< r NUM-REGS)))
+(define (valid-op  o) (and (>= o 0) (< o NUM-OPS)))
+(define (valid-imm i) (and (>= i 0) (< i IMM-RANGE)))
+(define (bool->int b) (if b 1 0))
+
+(define (op->string o)
+  (cond [(= o 0) "add"]
+        [(= o 1) "sub"]
+        [(= o 2) "xor"]
+        [(= o 3) "mul"]
+        [(= o 4) "shl"]
+        [(= o 5) "and"]
+        [(= o 6) "or"]
+        [(= o 7) "div"]
+        [(= o 8) "shr"]
+        [else     "???"]))
+
+(define (print-inst inst)
+  (printf "  R~a = ~a R~a R~a [imm=~a]\n"
+          (list-ref inst 0)
+          (op->string (list-ref inst 1))
+          (list-ref inst 2)
+          (list-ref inst 3)
+          (list-ref inst 4)))
+
+(define (print-program prog)
+  (for-each print-inst prog))
+
+(define (inst-equal? i1 i2)
+  (for/fold ([acc #t]) ([a i1] [b i2])
+    (and acc (= a b))))
+
+(define (hamming-distance prog1 prog2)
+  (apply + (map (lambda (i1 i2)
+                  (bool->int (not (inst-equal? i1 i2))))
+                prog1 prog2)))
+
+(define (sym-max a b) (if (>= a b) a b))
+
+(define (lookup-depth depths r)
+  (for/fold ([result (list-ref depths (- NUM-REGS 1))])
+            ([i (in-range (- NUM-REGS 1))])
+    (if (= r i) (list-ref depths i) result)))
+
+(define (update-depths depths dst new-val)
+  (for/list ([i (in-range NUM-REGS)])
+    (if (= dst i) new-val (list-ref depths i))))
+
+(define (compute-program-depth prog)
+  (define-values (_depths max-d)
+    (for/fold ([depths (make-list NUM-REGS 0)]
+               [max-d  0])
+              ([inst prog])
+      (define dst  (list-ref inst 0))
+      (define src1 (list-ref inst 2))
+      (define src2 (list-ref inst 3))
+      (define d1   (lookup-depth depths src1))
+      (define d2   (lookup-depth depths src2))
+      (define new-d (+ 1 (sym-max d1 d2)))
+      (values (update-depths depths dst new-d)
+              (sym-max max-d new-d))))
+  max-d)
+
+;; Dependency graph (for display/export)
+(define (find-last-writer prog reg before-idx)
+  (for/fold ([found #f])
+            ([i (in-range (- before-idx 1) -1 -1)])
+    (if (and (not found) (= (list-ref (list-ref prog i) 0) reg))
+        i
+        found)))
+
+(define (compute-dep-edges prog)
+  (define edges '())
+  (for ([j (in-range (length prog))])
+    (define inst-j (list-ref prog j))
+    (for ([src (list (list-ref inst-j 2) (list-ref inst-j 3))])
+      (define writer (find-last-writer prog src j))
+      (when writer
+        (set! edges (cons (list writer j src) edges)))))
+  (remove-duplicates (reverse edges)))
+
+(define (inst->string idx inst)
+  (format "[~a] R~a = ~a R~a R~a [imm=~a]"
+          idx
+          (list-ref inst 0)
+          (op->string (list-ref inst 1))
+          (list-ref inst 2)
+          (list-ref inst 3)
+          (list-ref inst 4)))
+
+(define (print-dep-graph prog label)
+  (define edges (compute-dep-edges prog))
+  (printf "\nData-Dependency Graph (~a):\n\n" label)
+  (for ([inst prog]
+        [j (in-naturals)])
+    (define incoming
+      (filter (lambda (e) (= (list-ref e 1) j)) edges))
+    (define base (inst->string j inst))
+    (if (null? incoming)
+        (printf "    ~a\n" base)
+        (printf "    ~a    <-- ~a\n"
+                base
+                (string-join
+                 (map (lambda (e)
+                        (format "[~a] via R~a" (list-ref e 0) (list-ref e 2)))
+                      incoming)
+                 ", "))))
+  (printf "\n  Depth: ~a/~a    Edges: ~a\n"
+          (compute-program-depth prog)
+          (- NUM-INSTR 1)
+          (length edges)))
+
+(define (export-dep-graph-dot prog test-num dir)
+  (define edges (compute-dep-edges prog))
+  (define path (build-path dir (format "test-~a-deps.dot" test-num)))
+  (with-output-to-file path #:exists 'replace
+    (lambda ()
+      (displayln "digraph deps {")
+      (displayln "  rankdir=TB;")
+      (displayln "  node [shape=box, fontname=\"monospace\"];")
+      (for ([inst prog]
+            [i (in-naturals)])
+        (printf "  i~a [label=\"~a\"];\n" i (inst->string i inst)))
+      (for ([e edges])
+        (printf "  i~a -> i~a [label=\"R~a\"];\n"
+                (list-ref e 0) (list-ref e 1) (list-ref e 2)))
+      (displayln "}")))
+  (printf "  Exported: ~a\n" (path->string path)))
+
+(define (export-all-dep-graphs-dot suite dir)
+  (define path (build-path dir "all-tests-deps.dot"))
+  (with-output-to-file path #:exists 'replace
+    (lambda ()
+      (displayln "digraph all_deps {")
+      (displayln "  rankdir=TB;")
+      (displayln "  node [shape=box, fontname=\"monospace\"];")
+      (for ([prog suite]
+            [t (in-naturals 1)])
+        (define edges (compute-dep-edges prog))
+        (printf "\n  subgraph cluster_~a {\n" t)
+        (printf "    label=\"Test ~a  (depth ~a/~a)\";\n"
+                t (compute-program-depth prog) (- NUM-INSTR 1))
+        (for ([inst prog]
+              [i (in-naturals)])
+          (printf "    t~a_i~a [label=\"~a\"];\n" t i (inst->string i inst)))
+        (for ([e edges])
+          (printf "    t~a_i~a -> t~a_i~a [label=\"R~a\"];\n"
+                  t (list-ref e 0) t (list-ref e 1) (list-ref e 2)))
+        (displayln "  }"))
+      (displayln "}")))
+  (printf "  Exported all tests: ~a\n" (path->string path)))
+
+;; N-gram
+(define (extract-opcodes prog)
+  (map (lambda (inst) (list-ref inst 1)) prog))
+
+(define (ngrams-of-list lst n)
+  (if (> n (length lst))
+      '()
+      (for/list ([i (in-range (- (length lst) (- n 1)))])
+        (for/list ([j (in-range n)])
+          (list-ref lst (+ i j))))))
+
+(define (extract-opcode-ngrams prog n)
+  (ngrams-of-list (extract-opcodes prog) n))
+
+(define (ngram-equal? ng1 ng2)
+  (for/fold ([acc #t]) ([a ng1] [b ng2])
+    (and acc (= a b))))
+
+(define (ngram-overlap-count prog-a prog-b n)
+  (define ngrams-a (extract-opcode-ngrams prog-a n))
+  (define ngrams-b (extract-opcode-ngrams prog-b n))
+  (foldl (lambda (ng-a acc)
+           (+ acc (bool->int
+                   (for/fold ([acc #f]) ([ng-b ngrams-b])
+                     (or acc (ngram-equal? ng-a ng-b))))))
+         0 ngrams-a))
+
+;; Test Generation: minimize total 2-gram overlap (optimization)
+(define (generate-test)
+  (clear-vc!)
+
+  (define new-prog
+    (for/list ([_ (in-range NUM-INSTR)])
+      (define-symbolic* dst op src1 src2 imm integer?)
+      (list dst op src1 src2 imm)))
+
+  (define (total-2gram-overlap)
+    (foldl (lambda (h-prog acc)
+             (+ acc (ngram-overlap-count new-prog h-prog 2)))
+           0 (unbox test-suite)))
+
+  (define sol
+    (if (null? (unbox test-suite))
+        ;; Empty suite: any valid program
+        (solve
+         (begin
+           (for ([inst new-prog])
+             (assert (and (valid-reg (list-ref inst 0))
+                          (valid-op  (list-ref inst 1))
+                          (valid-reg (list-ref inst 2))
+                          (valid-reg (list-ref inst 3))
+                          (valid-imm (list-ref inst 4)))))
+           (assert (for/fold ([acc #f]) ([inst new-prog])
+                     (or acc (= (list-ref inst 1) 3))))))
+        ;; Minimize total 2-gram overlap with existing suite
+        (optimize
+         #:minimize (list (total-2gram-overlap))
+         #:guarantee
+         (begin
+           (for ([inst new-prog])
+             (assert (and (valid-reg (list-ref inst 0))
+                          (valid-op  (list-ref inst 1))
+                          (valid-reg (list-ref inst 2))
+                          (valid-reg (list-ref inst 3))
+                          (valid-imm (list-ref inst 4)))))
+           (assert (for/fold ([acc #f]) ([inst new-prog])
+                     (or acc (= (list-ref inst 1) 3))))))))
+
+  (if (sat? sol)
+      (let ([concrete
+             (map (lambda (inst)
+                    (map (lambda (v) (evaluate v sol)) inst))
+                  new-prog)])
+        (values #t concrete))
+      (values #f '())))
+
+;; Diversity stats
+(define (show-diversity-stats)
+  (define suite (unbox test-suite))
+  (define n (length suite))
+  (cond
+    [(< n 2)
+     (displayln "\nNeed at least 2 tests for diversity statistics.")]
+    [else
+     (displayln "\nPairwise Hamming distances:")
+     (define all-dists '())
+     (for ([i (in-range n)])
+       (for ([j (in-range (+ i 1) n)])
+         (define d (hamming-distance (list-ref suite i) (list-ref suite j)))
+         (set! all-dists (cons d all-dists))
+         (printf "  Test ~a vs Test ~a: ~a/~a instructions differ\n"
+                 (+ i 1) (+ j 1) d NUM-INSTR)))
+     (printf "\n  Min: ~a  Max: ~a  Avg: ~a\n"
+             (apply min all-dists)
+             (apply max all-dists)
+             (exact->inexact (/ (apply + all-dists) (length all-dists))))
+     (define ops-used
+       (remove-duplicates
+        (apply append
+               (map (lambda (prog)
+                      (map (lambda (inst) (list-ref inst 1)) prog))
+                    suite))))
+     (printf "  Opcode coverage: ~a/~a (~a)\n"
+             (length ops-used) NUM-OPS
+             (string-join (map op->string (sort ops-used <)) ", "))
+     (displayln "\nData-dependency depths:")
+     (define all-depths
+       (for/list ([prog suite]
+                  [i (in-naturals 1)])
+         (define d (compute-program-depth prog))
+         (printf "  Test ~a: depth ~a/~a\n" i d (- NUM-INSTR 1))
+         d))
+     (printf "\n  Min depth: ~a  Max depth: ~a  Avg: ~a\n"
+             (apply min all-depths)
+             (apply max all-depths)
+             (exact->inexact (/ (apply + all-depths) (length all-depths))))
+     (displayln "\nOpcode N-gram overlap:")
+     (for ([ng-size (list 2 4 8)])
+       (define num-per-prog (max 0 (- NUM-INSTR (- ng-size 1))))
+       (when (> num-per-prog 0)
+         (define all-overlaps '())
+         (for ([i (in-range n)])
+           (for ([j (in-range (+ i 1) n)])
+             (define ov (ngram-overlap-count (list-ref suite i)
+                                             (list-ref suite j) ng-size))
+             (set! all-overlaps (cons ov all-overlaps))))
+         (define unique-ngrams
+           (remove-duplicates
+            (apply append
+                   (map (lambda (prog)
+                          (extract-opcode-ngrams prog ng-size))
+                        suite))))
+         (printf "  n=~a (~a per program):\n"
+                 ng-size num-per-prog)
+         (printf "    Pairwise overlap -- Avg: ~a  Max: ~a\n"
+                 (if (null? all-overlaps) 0
+                     (exact->inexact (/ (apply + all-overlaps)
+                                       (length all-overlaps))))
+                 (if (null? all-overlaps) 0 (apply max all-overlaps)))
+         (printf "    Unique ~a-grams across suite: ~a\n"
+                 ng-size (length unique-ngrams))))]))
+
+(define (read-input prompt)
+  (display prompt)
+  (flush-output)
+  (define raw (read-line))
+  (if (eof-object? raw) #f (string-trim raw)))
+
+(define (show-ngram-config)
+  (displayln "\nMode: minimize total 2-gram overlap (optimization)"))
+
+;; JSON Export -> ngram-suite-export.json
+(define (export-suite-json dir)
+  (define suite (unbox test-suite))
+  (define path (build-path dir "ngram-suite-export.json"))
+  (define json-data
+    (for/list ([prog suite])
+      (hasheq 'instructions
+        (for/list ([inst prog])
+          (hasheq 'dst (format "R~a" (list-ref inst 0))
+                  'op (op->string (list-ref inst 1))
+                  'src1 (format "R~a" (list-ref inst 2))
+                  'src2 (format "R~a" (list-ref inst 3))
+                  'imm (list-ref inst 4))))))
+  (with-output-to-file path #:exists 'replace
+    (lambda ()
+      (write-json json-data)))
+  (printf "Exported ~a test(s) to ~a\n" (length suite) (path->string path)))
+
+;; REPL
+(define (show-help)
+  (displayln "\nCommands:")
+  (displayln "  [g]enerate   - Synthesize a new n-gram diverse test")
+  (displayln "  [s]how       - Display the current test suite")
+  (displayln "  [d]iversity  - Show pairwise diversity statistics")
+  (displayln "  [p]lot       - Show/export dependency graph")
+  (displayln "  [n]gram      - Show n-gram mode")
+  (displayln "  [e]xport     - Export to ngram-suite-export.json")
+  (displayln "  [l]oad-seed  - Add the default seed program")
+  (displayln "  [q]uit       - Exit"))
+
+(define (repl)
+  (define input (read-input (format "\n[~a test(s)] > " (suite-size))))
+
+  (cond
+    [(or (not input) (member input '("q" "quit" "exit")))
+     (printf "\nSuite has ~a test(s). Goodbye.\n" (suite-size))]
+
+    [(member input '("g" "generate"))
+     (printf "\nSynthesizing n-gram diverse test...\n")
+     (define-values (ok? prog) (generate-test))
+     (cond
+       [ok?
+        (displayln "\nSynthesized Program:")
+        (print-program prog)
+        (printf "\n  Depth: ~a/~a\n" (compute-program-depth prog) (- NUM-INSTR 1))
+        (when (> (suite-size) 0)
+          (define dists (map (lambda (h) (hamming-distance prog h))
+                            (unbox test-suite)))
+          (printf "  Hamming to existing: ~a\n" dists)
+          (define ov2 (map (lambda (h) (ngram-overlap-count prog h 2))
+                          (unbox test-suite)))
+          (printf "  2-gram overlap with existing: ~a (total ~a)\n"
+                  ov2 (apply + ov2)))
+        (define ans (read-input "\nAdd to test suite? [y/n] "))
+        (when (and ans (member ans '("y" "yes")))
+          (add-to-suite! prog)
+          (printf "Added. Suite now has ~a test(s).\n" (suite-size)))]
+       [else
+        (displayln "UNSAT.")])
+     (repl)]
+
+    [(member input '("s" "show"))
+     (define suite (unbox test-suite))
+     (if (null? suite)
+         (displayln "\nSuite is empty.")
+         (for ([prog suite] [i (in-naturals 1)])
+           (printf "\n--- Test ~a ---\n" i)
+           (print-program prog)))
+     (repl)]
+
+    [(member input '("d" "diversity")) (show-diversity-stats) (repl)]
+    [(member input '("n" "ngram")) (show-ngram-config) (repl)]
+
+    [(member input '("p" "plot"))
+     (define suite (unbox test-suite))
+     (if (null? suite)
+         (displayln "\nSuite is empty.")
+         (begin
+           (define ans (read-input (format "Which test? (1-~a, or 'all'): " (length suite))))
+           (cond
+             [(and ans (string=? ans "all"))
+              (for ([prog suite] [i (in-naturals 1)])
+                (print-dep-graph prog (format "Test ~a" i)))
+              (export-all-dep-graphs-dot suite (current-directory))]
+             [(and ans (string->number ans))
+              (define idx (- (string->number ans) 1))
+              (when (and (>= idx 0) (< idx (length suite)))
+                (let ([prog (list-ref suite idx)])
+                  (print-dep-graph prog (format "Test ~a" (+ idx 1)))
+                  (export-dep-graph-dot prog (+ idx 1) (current-directory))))])))
+     (repl)]
+
+    [(member input '("e" "export"))
+     (if (= (suite-size) 0)
+         (displayln "\nSuite is empty.")
+         (export-suite-json (current-directory)))
+     (repl)]
+
+    [(member input '("l" "load-seed" "load"))
+     (add-to-suite! SEED-PROGRAM)
+     (printf "Loaded seed. Suite: ~a tests.\n" (suite-size))
+     (repl)]
+
+    [(member input '("?" "h" "help")) (show-help) (repl)]
+    [(string=? input "") (repl)]
+    [else (printf "Unknown: ~a\n" input) (repl)]))
+
+;; Batch
+(define (batch-generate! count output-dir seed?)
+  (when seed?
+    (add-to-suite! SEED-PROGRAM)
+    (displayln "  Loaded seed program."))
+  (define target count)
+  (define failures 0)
+  (define max-consecutive-failures 10)
+  (let loop ()
+    (when (and (< (suite-size) (+ target (if seed? 1 0)))
+               (< failures max-consecutive-failures))
+      (define-values (ok? prog) (generate-test))
+      (cond
+        [ok?
+         (add-to-suite! prog)
+         (set! failures 0)
+         (printf "  [~a/~a] synthesized (depth ~a)\n"
+                 (- (suite-size) (if seed? 1 0)) target
+                 (compute-program-depth prog))
+         (loop)]
+        [else
+         (set! failures (+ failures 1))
+         (printf "  UNSAT (~a). Retrying...\n" failures)
+         (loop)])))
+  (define generated (- (suite-size) (if seed? 1 0)))
+  (printf "\nGenerated ~a / ~a tests.\n" generated target)
+  (when (< generated target)
+    (printf "WARNING: Constraint space exhausted.\n"))
+  (export-suite-json output-dir)
+  (printf "Done. Exported to ngram-suite-export.json\n"))
+
+;; Entry
+(define batch-count (box #f))
+(define batch-output-dir (box "."))
+(define batch-no-seed (box #f))
+
+(command-line
+ #:once-each
+ ["--batch" n "Generate N tests and export to ngram-suite-export.json"
+  (set-box! batch-count (string->number n))]
+ ["--output-dir" dir "Output directory" (set-box! batch-output-dir dir)]
+ ["--no-seed" "Skip seed in batch" (set-box! batch-no-seed #t)]
+ #:args () (void))
+
+(cond
+  [(unbox batch-count)
+   (printf "=== SDC N-gram-only Batch Generator ===\n")
+   (printf "Generating ~a tests (n-gram diversity, no depth constraint)...\n" (unbox batch-count))
+   (batch-generate! (unbox batch-count)
+                    (unbox batch-output-dir)
+                    (not (unbox batch-no-seed)))]
+  [else
+  (displayln "=== SDC N-gram-only Generator (optimize) ===")
+  (show-ngram-config)
+   (show-help)
+   (repl)])
