@@ -1,0 +1,2 @@
+# Benchmark uses only Python stdlib. No pip packages required.
+# Python 3.7+ recommended. Install LLVM (llvm-stress) and Racket+Rosette for full functionality.
