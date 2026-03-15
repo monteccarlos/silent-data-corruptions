@@ -5,7 +5,7 @@
 ;; --------------------------------------------
 ;; N-gram-only variant: optimization (minimize overlap) instead of
 ;; satisfaction (cap overlap). No depth constraint.
-;; Exports to ngram-suite-export.json.
+;; Exports to bigram-suite-export.json.
 ;; --------------------------------------------
 
 ;; Parameters
@@ -338,10 +338,10 @@
 (define (show-ngram-config)
   (displayln "\nMode: minimize total 2-gram overlap (optimization)"))
 
-;; JSON Export -> ngram-suite-export.json
+;; JSON Export -> bigram-suite-export.json
 (define (export-suite-json dir)
   (define suite (unbox test-suite))
-  (define path (build-path dir "ngram-suite-export.json"))
+  (define path (build-path dir "bigram-suite-export.json"))
   (define json-data
     (for/list ([prog suite])
       (hasheq 'instructions
@@ -364,7 +364,7 @@
   (displayln "  [d]iversity  - Show pairwise diversity statistics")
   (displayln "  [p]lot       - Show/export dependency graph")
   (displayln "  [n]gram      - Show n-gram mode")
-  (displayln "  [e]xport     - Export to ngram-suite-export.json")
+  (displayln "  [e]xport     - Export to bigram-suite-export.json")
   (displayln "  [l]oad-seed  - Add the default seed program")
   (displayln "  [q]uit       - Exit"))
 
@@ -474,7 +474,7 @@
   (when (< generated target)
     (printf "WARNING: Constraint space exhausted.\n"))
   (export-suite-json output-dir)
-  (printf "Done. Exported to ngram-suite-export.json\n"))
+  (printf "Done. Exported to bigram-suite-export.json\n"))
 
 ;; Entry
 (define batch-count (box #f))
@@ -483,7 +483,7 @@
 
 (command-line
  #:once-each
- ["--batch" n "Generate N tests and export to ngram-suite-export.json"
+ ["--batch" n "Generate N tests and export to bigram-suite-export.json"
   (set-box! batch-count (string->number n))]
  ["--output-dir" dir "Output directory" (set-box! batch-output-dir dir)]
  ["--no-seed" "Skip seed in batch" (set-box! batch-no-seed #t)]

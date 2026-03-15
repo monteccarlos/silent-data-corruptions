@@ -8,4 +8,3 @@ compiled/
 
 .venv/
 stress_ll/
-*.json

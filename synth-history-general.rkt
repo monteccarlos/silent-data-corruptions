@@ -3,18 +3,32 @@
 (require racket/string json racket/cmdline)
 
 ;; --------------------------------------------
-;; N-gram-only variant: optimization (minimize overlap) instead of
-;; satisfaction (cap overlap). No depth constraint.
-;; Exports to quadgram-suite-export.json.
+;; Parameters
 ;; --------------------------------------------
 
-;; Parameters
 (define NUM-REGS    8)
 (define NUM-OPS     9)
 (define NUM-INSTR   8)
 (define IMM-RANGE  16)
+(define MIN-HAMMING 2)
+(define MIN-DEPTH   2)
 
+;; N-gram overlap limits: (n . max-shared) per n-gram size.
+;; With 8 instructions: n=2 yields 7 bigrams, n=4 yields 5, n=8 yields 1.
+;; Stored in a box so users can reconfigure at startup or via the REPL.
+(define NGRAM-CONSTRAINTS
+  (box (list (cons 2 2)
+             (cons 4 1)
+             (cons 8 0))))
+
+;; --------------------------------------------
 ;; Default Seed Program
+;; Each instruction = (dst op src1 src2 imm)
+;; ops: 0=add  1=sub  2=xor  3=mul
+;;      4=shl  5=and  6=or   7=div  8=shr
+;; imm: constant folded into the result
+;; --------------------------------------------
+
 (define SEED-PROGRAM
   (list
    (list 0 0 1 2  0)
@@ -26,6 +40,10 @@
    (list 6 6 5 3  1)
    (list 7 7 6 0  0)))
 
+;; --------------------------------------------
+;; Mutable Test Suite (History)
+;; --------------------------------------------
+
 (define test-suite (box '()))
 
 (define (add-to-suite! prog)
@@ -34,7 +52,10 @@
 (define (suite-size)
   (length (unbox test-suite)))
 
+;; --------------------------------------------
 ;; Helpers
+;; --------------------------------------------
+
 (define (valid-reg r) (and (>= r 0) (< r NUM-REGS)))
 (define (valid-op  o) (and (>= o 0) (< o NUM-OPS)))
 (define (valid-imm i) (and (>= i 0) (< i IMM-RANGE)))
@@ -63,26 +84,32 @@
 (define (print-program prog)
   (for-each print-inst prog))
 
+;; Instruction-level equality (works for both symbolic and concrete values)
 (define (inst-equal? i1 i2)
   (for/fold ([acc #t]) ([a i1] [b i2])
     (and acc (= a b))))
 
+;; Hamming distance = number of instruction positions that differ
 (define (hamming-distance prog1 prog2)
   (apply + (map (lambda (i1 i2)
                   (bool->int (not (inst-equal? i1 i2))))
                 prog1 prog2)))
 
+;; Symbolic-safe max (produces ITE node for the solver)
 (define (sym-max a b) (if (>= a b) a b))
 
+;; Symbolic index into an N-element depth list (ITE chain over NUM-REGS)
 (define (lookup-depth depths r)
   (for/fold ([result (list-ref depths (- NUM-REGS 1))])
             ([i (in-range (- NUM-REGS 1))])
     (if (= r i) (list-ref depths i) result)))
 
+;; Functional update at symbolic index, returns a new list
 (define (update-depths depths dst new-val)
   (for/list ([i (in-range NUM-REGS)])
     (if (= dst i) new-val (list-ref depths i))))
 
+;; Longest chain of register read-after-write dependencies
 (define (compute-program-depth prog)
   (define-values (_depths max-d)
     (for/fold ([depths (make-list NUM-REGS 0)]
@@ -98,7 +125,11 @@
               (sym-max max-d new-d))))
   max-d)
 
-;; Dependency graph (for display/export)
+;; --------------------------------------------
+;; Dependency Graph
+;; --------------------------------------------
+
+;; Most recent instruction before `before-idx` that writes to `reg`
 (define (find-last-writer prog reg before-idx)
   (for/fold ([found #f])
             ([i (in-range (- before-idx 1) -1 -1)])
@@ -106,6 +137,7 @@
         i
         found)))
 
+;; List of (from-idx to-idx register) edges
 (define (compute-dep-edges prog)
   (define edges '())
   (for ([j (in-range (length prog))])
@@ -187,10 +219,14 @@
       (displayln "}")))
   (printf "  Exported all tests: ~a\n" (path->string path)))
 
-;; N-gram
+;; --------------------------------------------
+;; Opcode N-gram Similarity
+;; --------------------------------------------
+
 (define (extract-opcodes prog)
   (map (lambda (inst) (list-ref inst 1)) prog))
 
+;; Contiguous subsequences of length n from a list
 (define (ngrams-of-list lst n)
   (if (> n (length lst))
       '()
@@ -201,20 +237,37 @@
 (define (extract-opcode-ngrams prog n)
   (ngrams-of-list (extract-opcodes prog) n))
 
+;; Element-wise equality of two n-grams (symbolic-safe)
 (define (ngram-equal? ng1 ng2)
   (for/fold ([acc #t]) ([a ng1] [b ng2])
     (and acc (= a b))))
 
+;; Count of n-grams from prog-a that appear anywhere in prog-b's n-gram set.
+;; Works when prog-a is symbolic and prog-b is concrete (synthesis) or both
+;; concrete (statistics).
 (define (ngram-overlap-count prog-a prog-b n)
   (define ngrams-a (extract-opcode-ngrams prog-a n))
   (define ngrams-b (extract-opcode-ngrams prog-b n))
-  (foldl (lambda (ng-a acc)
-           (+ acc (bool->int
-                   (for/fold ([acc #f]) ([ng-b ngrams-b])
-                     (or acc (ngram-equal? ng-a ng-b))))))
-         0 ngrams-a))
+  (apply +
+    (map (lambda (ng-a)
+           (bool->int
+            (for/fold ([acc #f]) ([ng-b ngrams-b])
+              (or acc (ngram-equal? ng-a ng-b)))))
+         ngrams-a)))
 
-;; Test Generation: minimize total 4-gram overlap (optimization)
+;; --------------------------------------------
+;; Test Generation
+;;
+;; Creates fresh symbolic variables, asserts:
+;;   1. Valid register/opcode/immediate ranges
+;;   2. At least one multiply
+;;   3. Data-dependency depth >= MIN-DEPTH
+;;   4. Hamming distance >= MIN-HAMMING from
+;;      EVERY program already in the suite
+;;   5. Opcode n-gram overlap <= max for each
+;;      n in NGRAM-CONSTRAINTS
+;; --------------------------------------------
+
 (define (generate-test)
   (clear-vc!)
 
@@ -223,37 +276,38 @@
       (define-symbolic* dst op src1 src2 imm integer?)
       (list dst op src1 src2 imm)))
 
-  (define (total-4gram-overlap)
-    (foldl (lambda (h-prog acc)
-             (+ acc (ngram-overlap-count new-prog h-prog 4)))
-           0 (unbox test-suite)))
-
   (define sol
-    (if (null? (unbox test-suite))
-        ;; Empty suite: any valid program
-        (solve
-         (begin
-           (for ([inst new-prog])
-             (assert (and (valid-reg (list-ref inst 0))
-                          (valid-op  (list-ref inst 1))
-                          (valid-reg (list-ref inst 2))
-                          (valid-reg (list-ref inst 3))
-                          (valid-imm (list-ref inst 4)))))
-           (assert (for/fold ([acc #f]) ([inst new-prog])
-                     (or acc (= (list-ref inst 1) 3))))))
-        ;; Minimize total 4-gram overlap with existing suite
-        (optimize
-         #:minimize (list (total-4gram-overlap))
-         #:guarantee
-         (begin
-           (for ([inst new-prog])
-             (assert (and (valid-reg (list-ref inst 0))
-                          (valid-op  (list-ref inst 1))
-                          (valid-reg (list-ref inst 2))
-                          (valid-reg (list-ref inst 3))
-                          (valid-imm (list-ref inst 4)))))
-           (assert (for/fold ([acc #f]) ([inst new-prog])
-                     (or acc (= (list-ref inst 1) 3))))))))
+    (solve
+     (begin
+       ;; Validity
+       (for ([inst new-prog])
+         (assert (and (valid-reg (list-ref inst 0))
+                      (valid-op  (list-ref inst 1))
+                      (valid-reg (list-ref inst 2))
+                      (valid-reg (list-ref inst 3))
+                      (valid-imm (list-ref inst 4)))))
+
+       ;; Structural: at least one multiply
+       (assert
+        (for/fold ([acc #f]) ([inst new-prog])
+          (or acc (= (list-ref inst 1) 3))))
+
+       ;; Structural: require minimum data-dependency depth
+       (assert (>= (compute-program-depth new-prog) MIN-DEPTH))
+
+       ;; Diversity: must differ from every existing test
+       (for ([h-prog (unbox test-suite)])
+         (assert (>= (hamming-distance new-prog h-prog)
+                     MIN-HAMMING)))
+
+       ;; Diversity: limit opcode n-gram overlap at each window size
+       (for ([constraint (unbox NGRAM-CONSTRAINTS)])
+         (define ng-size (car constraint))
+         (define max-overlap (cdr constraint))
+         (when (<= ng-size NUM-INSTR)
+           (for ([h-prog (unbox test-suite)])
+             (assert (<= (ngram-overlap-count new-prog h-prog ng-size)
+                         max-overlap))))))))
 
   (if (sat? sol)
       (let ([concrete
@@ -263,7 +317,10 @@
         (values #t concrete))
       (values #f '())))
 
-;; Diversity stats
+;; --------------------------------------------
+;; Diversity Statistics
+;; --------------------------------------------
+
 (define (show-diversity-stats)
   (define suite (unbox test-suite))
   (define n (length suite))
@@ -275,14 +332,17 @@
      (define all-dists '())
      (for ([i (in-range n)])
        (for ([j (in-range (+ i 1) n)])
-         (define d (hamming-distance (list-ref suite i) (list-ref suite j)))
+         (define d (hamming-distance (list-ref suite i)
+                                     (list-ref suite j)))
          (set! all-dists (cons d all-dists))
          (printf "  Test ~a vs Test ~a: ~a/~a instructions differ\n"
                  (+ i 1) (+ j 1) d NUM-INSTR)))
      (printf "\n  Min: ~a  Max: ~a  Avg: ~a\n"
              (apply min all-dists)
              (apply max all-dists)
-             (exact->inexact (/ (apply + all-dists) (length all-dists))))
+             (exact->inexact (/ (apply + all-dists)
+                                (length all-dists))))
+
      (define ops-used
        (remove-duplicates
         (apply append
@@ -292,6 +352,7 @@
      (printf "  Opcode coverage: ~a/~a (~a)\n"
              (length ops-used) NUM-OPS
              (string-join (map op->string (sort ops-used <)) ", "))
+
      (displayln "\nData-dependency depths:")
      (define all-depths
        (for/list ([prog suite]
@@ -302,16 +363,22 @@
      (printf "\n  Min depth: ~a  Max depth: ~a  Avg: ~a\n"
              (apply min all-depths)
              (apply max all-depths)
-             (exact->inexact (/ (apply + all-depths) (length all-depths))))
+             (exact->inexact (/ (apply + all-depths)
+                                (length all-depths))))
+
      (displayln "\nOpcode N-gram overlap:")
-     (for ([ng-size (list 2 4 8)])
+     (for ([constraint (unbox NGRAM-CONSTRAINTS)])
+       (define ng-size (car constraint))
+       (define max-ov (cdr constraint))
        (define num-per-prog (max 0 (- NUM-INSTR (- ng-size 1))))
        (when (> num-per-prog 0)
          (define all-overlaps '())
          (for ([i (in-range n)])
            (for ([j (in-range (+ i 1) n)])
-             (define ov (ngram-overlap-count (list-ref suite i)
-                                             (list-ref suite j) ng-size))
+             (define ov
+               (ngram-overlap-count (list-ref suite i)
+                                    (list-ref suite j)
+                                    ng-size))
              (set! all-overlaps (cons ov all-overlaps))))
          (define unique-ngrams
            (remove-duplicates
@@ -319,15 +386,21 @@
                    (map (lambda (prog)
                           (extract-opcode-ngrams prog ng-size))
                         suite))))
-         (printf "  n=~a (~a per program):\n"
-                 ng-size num-per-prog)
+         (printf "  n=~a (~a per program, max allowed ~a):\n"
+                 ng-size num-per-prog max-ov)
          (printf "    Pairwise overlap -- Avg: ~a  Max: ~a\n"
                  (if (null? all-overlaps) 0
-                     (exact->inexact (/ (apply + all-overlaps)
-                                       (length all-overlaps))))
-                 (if (null? all-overlaps) 0 (apply max all-overlaps)))
+                     (exact->inexact
+                      (/ (apply + all-overlaps)
+                         (length all-overlaps))))
+                 (if (null? all-overlaps) 0
+                     (apply max all-overlaps)))
          (printf "    Unique ~a-grams across suite: ~a\n"
                  ng-size (length unique-ngrams))))]))
+
+;; --------------------------------------------
+;; Read a line safely (returns #f on EOF)
+;; --------------------------------------------
 
 (define (read-input prompt)
   (display prompt)
@@ -335,13 +408,40 @@
   (define raw (read-line))
   (if (eof-object? raw) #f (string-trim raw)))
 
-(define (show-ngram-config)
-  (displayln "\nMode: minimize total 4-gram overlap (optimization)"))
+;; --------------------------------------------
+;; N-gram Configuration
+;; --------------------------------------------
 
-;; JSON Export -> quadgram-suite-export.json
+(define (show-ngram-config)
+  (displayln "\nCurrent N-gram constraints:")
+  (for ([c (unbox NGRAM-CONSTRAINTS)])
+    (printf "  n=~a: max overlap ~a  (~a n-grams per program)\n"
+            (car c) (cdr c)
+            (max 0 (- NUM-INSTR (- (car c) 1))))))
+
+(define (configure-ngrams!)
+  (show-ngram-config)
+  (displayln "\nEnter new caps for each n-gram size (or press Enter to keep current):")
+  (define new-constraints
+    (for/list ([c (unbox NGRAM-CONSTRAINTS)])
+      (define ng-size (car c))
+      (define current-max (cdr c))
+      (define ans
+        (read-input (format "  n=~a max overlap [~a]: " ng-size current-max)))
+      (if (and ans (not (string=? ans "")) (string->number ans))
+          (cons ng-size (string->number ans))
+          c)))
+  (set-box! NGRAM-CONSTRAINTS new-constraints)
+  (displayln "\nUpdated constraints:")
+  (show-ngram-config))
+
+;; --------------------------------------------
+;; JSON Export
+;; --------------------------------------------
+
 (define (export-suite-json dir)
   (define suite (unbox test-suite))
-  (define path (build-path dir "quadgram-suite-export.json"))
+  (define path (build-path dir "suite-export-general.json"))
   (define json-data
     (for/list ([prog suite])
       (hasheq 'instructions
@@ -356,100 +456,154 @@
       (write-json json-data)))
   (printf "Exported ~a test(s) to ~a\n" (length suite) (path->string path)))
 
-;; REPL
+;; --------------------------------------------
+;; Interactive REPL
+;; --------------------------------------------
+
 (define (show-help)
   (displayln "\nCommands:")
-  (displayln "  [g]enerate   - Synthesize a new n-gram diverse test")
+  (displayln "  [g]enerate   - Synthesize a new diverse test")
   (displayln "  [s]how       - Display the current test suite")
   (displayln "  [d]iversity  - Show pairwise diversity statistics")
-  (displayln "  [p]lot       - Show/export dependency graph")
-  (displayln "  [n]gram      - Show n-gram mode")
-  (displayln "  [e]xport     - Export to quadgram-suite-export.json")
-  (displayln "  [l]oad-seed  - Add the default seed program")
+  (displayln "  [p]lot       - Show/export dependency graph for a test")
+  (displayln "  [n]gram      - View/change n-gram overlap limits")
+  (displayln "  [e]xport     - Export test suite to suite-export-general.json")
+  (displayln "  [l]oad-seed  - Add the default seed program to the suite")
   (displayln "  [q]uit       - Exit"))
 
 (define (repl)
   (define input (read-input (format "\n[~a test(s)] > " (suite-size))))
 
   (cond
+    ;; EOF or quit
     [(or (not input) (member input '("q" "quit" "exit")))
      (printf "\nSuite has ~a test(s). Goodbye.\n" (suite-size))]
 
+    ;; Generate
     [(member input '("g" "generate"))
-     (printf "\nSynthesizing n-gram diverse test...\n")
+     (printf "\nSynthesizing test diverse from ~a existing test(s)...\n"
+             (suite-size))
      (define-values (ok? prog) (generate-test))
      (cond
        [ok?
         (displayln "\nSynthesized Program:")
         (print-program prog)
-        (printf "\n  Depth: ~a/~a\n" (compute-program-depth prog) (- NUM-INSTR 1))
+        (printf "\n  Data-dependency depth: ~a/~a\n"
+                (compute-program-depth prog) (- NUM-INSTR 1))
+
         (when (> (suite-size) 0)
-          (define dists (map (lambda (h) (hamming-distance prog h))
-                            (unbox test-suite)))
-          (printf "  Hamming to existing: ~a\n" dists)
-          (define ov4 (map (lambda (h) (ngram-overlap-count prog h 4))
-                          (unbox test-suite)))
-          (printf "  4-gram overlap with existing: ~a (total ~a)\n"
-                  ov4 (apply + ov4)))
+          (define dists
+            (map (lambda (h) (hamming-distance prog h))
+                 (unbox test-suite)))
+          (printf "\n  Hamming distances to existing tests: ~a\n" dists)
+          (printf "  Min distance: ~a/~a\n"
+                  (apply min dists) NUM-INSTR)
+
+          (displayln "\n  N-gram overlap with existing tests:")
+          (for ([constraint (unbox NGRAM-CONSTRAINTS)])
+            (define ng-size (car constraint))
+            (define max-ov (cdr constraint))
+            (define num-per-prog (- NUM-INSTR (- ng-size 1)))
+            (when (> num-per-prog 0)
+              (define overlaps
+                (map (lambda (h)
+                       (ngram-overlap-count prog h ng-size))
+                     (unbox test-suite)))
+              (printf "    n=~a: ~a (max allowed ~a)\n"
+                      ng-size overlaps max-ov))))
+
         (define ans (read-input "\nAdd to test suite? [y/n] "))
         (when (and ans (member ans '("y" "yes")))
           (add-to-suite! prog)
           (printf "Added. Suite now has ~a test(s).\n" (suite-size)))]
        [else
-        (displayln "UNSAT.")])
+        (displayln "UNSAT: Cannot find a program satisfying the constraints.")
+        (displayln "Try lowering MIN-HAMMING, MIN-DEPTH, or NGRAM-CONSTRAINTS limits.")])
      (repl)]
 
+    ;; Show suite
     [(member input '("s" "show"))
      (define suite (unbox test-suite))
      (if (null? suite)
-         (displayln "\nSuite is empty.")
-         (for ([prog suite] [i (in-naturals 1)])
-           (printf "\n--- Test ~a ---\n" i)
-           (print-program prog)))
+         (displayln "\nSuite is empty. Use [l]oad-seed or [g]enerate to start.")
+         (begin
+           (printf "\nTest Suite (~a tests):\n" (length suite))
+           (for ([prog suite]
+                 [i (in-naturals 1)])
+             (printf "\n--- Test ~a ---\n" i)
+             (print-program prog))))
      (repl)]
 
-    [(member input '("d" "diversity")) (show-diversity-stats) (repl)]
-    [(member input '("n" "ngram")) (show-ngram-config) (repl)]
+    ;; Diversity statistics
+    [(member input '("d" "diversity"))
+     (show-diversity-stats)
+     (repl)]
 
+    ;; N-gram configuration
+    [(member input '("n" "ngram"))
+     (configure-ngrams!)
+     (repl)]
+
+    ;; Plot dependency graph
     [(member input '("p" "plot"))
      (define suite (unbox test-suite))
      (if (null? suite)
-         (displayln "\nSuite is empty.")
+         (displayln "\nSuite is empty. Load or generate tests first.")
          (begin
-           (define ans (read-input (format "Which test? (1-~a, or 'all'): " (length suite))))
+           (define ans
+             (read-input
+              (format "Which test? (1-~a, or 'all'): " (length suite))))
            (cond
              [(and ans (string=? ans "all"))
-              (for ([prog suite] [i (in-naturals 1)])
+              (for ([prog suite]
+                    [i (in-naturals 1)])
                 (print-dep-graph prog (format "Test ~a" i)))
               (export-all-dep-graphs-dot suite (current-directory))]
              [(and ans (string->number ans))
               (define idx (- (string->number ans) 1))
-              (when (and (>= idx 0) (< idx (length suite)))
-                (let ([prog (list-ref suite idx)])
-                  (print-dep-graph prog (format "Test ~a" (+ idx 1)))
-                  (export-dep-graph-dot prog (+ idx 1) (current-directory))))])))
+              (if (and (>= idx 0) (< idx (length suite)))
+                  (let ([prog (list-ref suite idx)])
+                    (print-dep-graph prog (format "Test ~a" (+ idx 1)))
+                    (export-dep-graph-dot prog (+ idx 1) (current-directory)))
+                  (printf "Invalid test number: ~a\n" ans))]
+             [else
+              (displayln "Cancelled.")])))
      (repl)]
 
+    ;; Export suite to JSON
     [(member input '("e" "export"))
      (if (= (suite-size) 0)
-         (displayln "\nSuite is empty.")
+         (displayln "\nSuite is empty. Nothing to export.")
          (export-suite-json (current-directory)))
      (repl)]
 
+    ;; Load seed
     [(member input '("l" "load-seed" "load"))
      (add-to-suite! SEED-PROGRAM)
-     (printf "Loaded seed. Suite: ~a tests.\n" (suite-size))
+     (printf "Loaded seed program. Suite now has ~a test(s).\n" (suite-size))
      (repl)]
 
-    [(member input '("?" "h" "help")) (show-help) (repl)]
-    [(string=? input "") (repl)]
-    [else (printf "Unknown: ~a\n" input) (repl)]))
+    ;; Help
+    [(member input '("?" "h" "help"))
+     (show-help)
+     (repl)]
 
-;; Batch
+    ;; Blank line — just re-prompt
+    [(string=? input "")
+     (repl)]
+
+    [else
+     (printf "Unknown command '~a'. Type ? for help.\n" input)
+     (repl)]))
+
+;; --------------------------------------------
+;; Batch Generation (non-interactive)
+;; --------------------------------------------
+
 (define (batch-generate! count output-dir seed?)
   (when seed?
     (add-to-suite! SEED-PROGRAM)
-    (displayln "  Loaded seed program."))
+    (displayln "  Loaded seed program as test 1."))
   (define target count)
   (define failures 0)
   (define max-consecutive-failures 10)
@@ -467,37 +621,51 @@
          (loop)]
         [else
          (set! failures (+ failures 1))
-         (printf "  UNSAT (~a). Retrying...\n" failures)
+         (printf "  UNSAT (~a consecutive). Retrying...\n" failures)
          (loop)])))
   (define generated (- (suite-size) (if seed? 1 0)))
-  (printf "\nGenerated ~a / ~a tests.\n" generated target)
+  (printf "\nGenerated ~a / ~a requested tests (suite total: ~a).\n"
+          generated target (suite-size))
   (when (< generated target)
-    (printf "WARNING: Constraint space exhausted.\n"))
+    (printf "WARNING: Constraint space exhausted after ~a tests.\n" generated))
   (export-suite-json output-dir)
-  (printf "Done. Exported to quadgram-suite-export.json\n"))
+  (printf "Done.\n"))
 
-;; Entry
+;; --------------------------------------------
+;; Entry Point
+;; --------------------------------------------
+
 (define batch-count (box #f))
 (define batch-output-dir (box "."))
 (define batch-no-seed (box #f))
 
 (command-line
  #:once-each
- ["--batch" n "Generate N tests and export to quadgram-suite-export.json"
+ ["--batch" n
+  "Generate N diverse tests non-interactively and export JSON"
   (set-box! batch-count (string->number n))]
- ["--output-dir" dir "Output directory" (set-box! batch-output-dir dir)]
- ["--no-seed" "Skip seed in batch" (set-box! batch-no-seed #t)]
- #:args () (void))
+ ["--output-dir" dir
+  "Directory for JSON export (default: current directory)"
+  (set-box! batch-output-dir dir)]
+ ["--no-seed"
+  "Skip loading the seed program in batch mode"
+  (set-box! batch-no-seed #t)]
+ #:args ()
+ (void))
 
 (cond
   [(unbox batch-count)
-   (printf "=== SDC N-gram-only Batch Generator ===\n")
-   (printf "Generating ~a tests (4-gram diversity, no depth constraint)...\n" (unbox batch-count))
+   (printf "=== SDC Batch Generator ===\n")
+   (printf "Generating ~a tests...\n" (unbox batch-count))
    (batch-generate! (unbox batch-count)
                     (unbox batch-output-dir)
                     (not (unbox batch-no-seed)))]
   [else
-  (displayln "=== SDC N-gram-only Generator (optimize) ===")
-  (show-ngram-config)
+   (displayln "=== SDC Test Suite Generator ===")
+   (displayln "Solver-aided diverse instruction sequence synthesis")
+   (show-ngram-config)
+   (define setup-ans (read-input "\nCustomize n-gram caps? [y/n] "))
+   (when (and setup-ans (member setup-ans '("y" "yes")))
+     (configure-ngrams!))
    (show-help)
    (repl)])
